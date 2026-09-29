@@ -79,11 +79,14 @@ const handleRecommend = async () => {
   resultData.value = null
 
   try {
-    const response = await axios.post('http://127.0.0.1:8000/api/allocate', {
-      total_budget: Number(budget.value),
-      device_type: deviceType.value,
-      use_case: useCase.value
-    })
+      // Ambil URL dari environment variable Vercel, kalau tak ada baru fallback ke localhost
+      const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000'
+
+      const response = await axios.post(`${API_BASE_URL}/api/allocate`, {
+        total_budget: Number(budget.value),
+        device_type: deviceType.value,
+        use_case: useCase.value
+      })
     
     resultData.value = response.data
   } catch (err) {
