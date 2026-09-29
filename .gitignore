@@ -1,0 +1,15 @@
+# Environment variables (SANGAT PENTING: Jangan sampai ke-push API Key lu!)
+.env
+.env.local
+
+# Node / Vue dependencies & build
+node_modules/
+dist/
+*.local
+
+# Python virtual environment & cache
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
