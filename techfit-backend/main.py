@@ -2,7 +2,9 @@ import os
 import json
 import time
 import itertools
-from typing import Dict, Any, List
+from collections import OrderedDict
+from typing import Dict, List, Tuple
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -10,14 +12,30 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
+
+# ============================================================================
+# ENVIRONMENT
+# ============================================================================
+
 load_dotenv()
+
+
+# ============================================================================
+# FASTAPI
+# ============================================================================
 
 app = FastAPI(
     title="TechFit Core Engine",
-    description="Deterministic Budget Allocator + Gemini Multi-Tier Fallback Recommendation Engine"
+    description=(
+        "Deterministic Budget Allocator + Gemini Recommendation Engine"
+    )
 )
 
-# CORS Setup untuk Frontend (Vue.js / Vite)
+
+# ============================================================================
+# CORS
+# ============================================================================
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,217 +44,676 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =========================================================================
-# 1. MULTI-ACCOUNT API KEY ROTATOR (15 RPM Per Tier)
-# =========================================================================
-# Mengambil daftar API Keys dari .env untuk memecah batasan Rate Limit per Project
+
+# ============================================================================
+# 1. GEMINI API KEY ROTATOR
+# ============================================================================
+#
+# Key tetap diputar round-robin untuk membagi quota.
+#
+# Bedanya dengan versi lama:
+# - Client tidak dibuat ulang setiap request.
+# - Satu client disimpan untuk setiap API key.
+#
+# ============================================================================
+
 api_keys = [
     os.getenv("GEMINI_API_KEY_1"),
     os.getenv("GEMINI_API_KEY_2"),
     os.getenv("GEMINI_API_KEY_3"),
 ]
 
-# Filter key yang benar-benar terisi
-valid_keys = [k for k in api_keys if k]
+valid_keys = [key for key in api_keys if key]
 
 if not valid_keys:
-    raise RuntimeError("Minimal harus ada 1 GEMINI_API_KEY terpasang di .env!")
-
-# Generator round-robin ganti API Key secara bergantian di setiap panggilan client
-key_rotator = itertools.cycle(valid_keys)
-
-
-def get_genai_client() -> genai.Client:
-    """
-    [FUNCTION] Rotating Client Instance Generator
-    Mengambil instance genai.Client menggunakan API key giliran berikutnya.
-    """
-    current_key = next(key_rotator)
-    return genai.Client(api_key=current_key)
+    raise RuntimeError(
+        "Minimal harus ada 1 GEMINI_API_KEY terpasang!"
+    )
 
 
-# =========================================================================
-# 2. MODEL HIERARCHY / FALLBACK CHAIN CONFIGURATION
-# =========================================================================
-# Urutan degradasi model dari yang paling presisi hingga jalur darurat
-MODEL_FALLBACK_CHAIN = [
-    # Tier 1: Flagship Precision (Sangat akurat, taat constraint, limit 5 RPM/key)
-    {"name": "gemini-3.8-flash", "tier": "Tier 1: Presisi Maksimal (Standard)"},
-    {"name": "gemini-3.7-flash", "tier": "Tier 1: Presisi Maksimal (Standard)"},
-    {"name": "gemini-3.6-flash", "tier": "Tier 1: Presisi Maksimal (Standard)"},
-    {"name": "gemini-3.5-flash", "tier": "Tier 1: Presisi Standar"},
-    
-    # Tier 2: Mid & Workhorse (Bagus, kuota badak, breakdown rajin tapi harga kadang offset)
-    {"name": "gemini-3.5-flash-lite", "tier": "Tier 2: Mode Cepat (Toleransi Harga +5%)"},
-    
-    # Tier 3: Emergency Fallback (Sangat disiplin budget, tapi suka bundling/pemalas)
-    {"name": "gemini-3.1-flash-lite", "tier": "Tier 3: Mode Hemat Cap Cepat (Item Bundled)"},
+# Iterator untuk round-robin API key
+key_rotator = itertools.cycle(range(len(valid_keys)))
+
+
+# Client dibuat SEKALI untuk setiap API key.
+# Tidak perlu membuat genai.Client baru pada setiap request.
+GENAI_CLIENTS: List[genai.Client] = [
+    genai.Client(api_key=key)
+    for key in valid_keys
 ]
 
 
-# =========================================================================
-# 3. IN-MEMORY CACHE ENGINE
-# =========================================================================
-# Cache lokal di memori server untuk mencegah hit berulang ke Google API (0ms response)
-RECOMMENDATION_CACHE: Dict[str, tuple[dict, float]] = {}
-CACHE_TTL_SECONDS = 3600  # Waktu simpan cache: 1 Jam
-
-
-def get_cache_key(budget: int, device_type: str, use_case: str) -> str:
+def get_genai_client() -> Tuple[genai.Client, int]:
     """
-    [FUNCTION] Unique Cache Key Generator
-    Format: {device_type}_{use_case}_{budget}
+    Mengambil client berdasarkan rotasi API key.
+
+    Return:
+        (client, key_index)
     """
-    return f"{device_type.lower()}_{use_case.lower()}_{budget}"
+
+    key_index = next(key_rotator)
+
+    return GENAI_CLIENTS[key_index], key_index
 
 
-# =========================================================================
-# 4. PYDANTIC SCHEMAS (WITH METADATA FOR FRONTEND UI)
-# =========================================================================
+# ============================================================================
+# 2. MODEL CONFIGURATION
+# ============================================================================
+#
+# Sengaja hanya 2 level.
+#
+# Primary:
+#   Model utama dengan kualitas terbaik.
+#
+# Fallback:
+#   Model yang lebih ringan untuk kondisi 429 / 503 / unavailable.
+#
+# ============================================================================
+
+PRIMARY_MODEL = "gemini-3.8-flash"
+
+FALLBACK_MODEL = "gemini-3.5-flash-lite"
+
+
+MODEL_METADATA = {
+    PRIMARY_MODEL: {
+        "tier": "Tier 1: Presisi Maksimal"
+    },
+
+    FALLBACK_MODEL: {
+        "tier": "Tier 2: Fast Fallback"
+    }
+}
+
+
+# ============================================================================
+# 3. IN-MEMORY CACHE
+# ============================================================================
+#
+# Cache ini hanya L1 cache.
+#
+# Kelebihan:
+# - Sangat cepat.
+# - Tidak perlu database/Redis.
+#
+# Kekurangan:
+# - Hilang ketika Render restart/redeploy/sleep.
+#
+# ============================================================================
+
+RECOMMENDATION_CACHE = OrderedDict()
+
+CACHE_TTL_SECONDS = 3600          # 1 jam
+MAX_CACHE_ENTRIES = 200           # batas RAM
+
+
+def get_cache_key(
+    budget: int,
+    device_type: str,
+    use_case: str
+) -> str:
+
+    return (
+        f"{device_type.strip().lower()}"
+        f"_{use_case.strip().lower()}"
+        f"_{budget}"
+    )
+
+
+def get_cached_result(cache_key: str):
+
+    cached = RECOMMENDATION_CACHE.get(cache_key)
+
+    if cached is None:
+        return None
+
+    data, timestamp = cached
+
+    current_time = time.time()
+
+    # Expired
+    if current_time - timestamp >= CACHE_TTL_SECONDS:
+
+        del RECOMMENDATION_CACHE[cache_key]
+
+        return None
+
+    # LRU:
+    # Entry yang baru digunakan dipindahkan ke belakang.
+    RECOMMENDATION_CACHE.move_to_end(cache_key)
+
+    return data
+
+
+def set_cached_result(cache_key: str, data: dict):
+
+    # Kalau key sudah ada, hapus dulu supaya urutan LRU benar.
+    if cache_key in RECOMMENDATION_CACHE:
+        del RECOMMENDATION_CACHE[cache_key]
+
+    RECOMMENDATION_CACHE[cache_key] = (
+        data,
+        time.time()
+    )
+
+    # Buang entry paling lama kalau cache terlalu besar.
+    while len(RECOMMENDATION_CACHE) > MAX_CACHE_ENTRIES:
+        RECOMMENDATION_CACHE.popitem(last=False)
+
+
+# ============================================================================
+# 4. PYDANTIC SCHEMAS
+# ============================================================================
+
 class BudgetRequest(BaseModel):
-    total_budget: int = Field(..., ge=3000000, le=100000000, description="Budget Rp 3M - Rp 100M")
-    device_type: str = Field(..., description="pc / laptop")
-    use_case: str = Field(..., description="gaming / editing / office")
+
+    total_budget: int = Field(
+        ...,
+        ge=3_000_000,
+        le=100_000_000,
+        description="Budget Rp 3M - Rp 100M"
+    )
+
+    device_type: str = Field(
+        ...,
+        description="pc / laptop"
+    )
+
+    use_case: str = Field(
+        ...,
+        description="gaming / editing / office"
+    )
+
 
 class HardwareItem(BaseModel):
-    name: str = Field(..., description="Nama spesifik komponen/laptop")
-    category: str = Field(..., description="Kategori item")
-    price_min: int = Field(..., description="Harga batas bawah IDR")
-    price_max: int = Field(..., description="Harga batas atas IDR")
-    specs_summary: str = Field(..., description="Ringkasan spesifikasi")
-    search_query: str = Field(..., description="Query pencarian presisi Tokopedia/Shopee")
+
+    name: str = Field(
+        ...,
+        description="Nama spesifik komponen/laptop"
+    )
+
+    category: str = Field(
+        ...,
+        description="Kategori item"
+    )
+
+    price_min: int = Field(
+        ...,
+        description="Harga batas bawah IDR"
+    )
+
+    price_max: int = Field(
+        ...,
+        description="Harga batas atas IDR"
+    )
+
+    specs_summary: str = Field(
+        ...,
+        description="Ringkasan spesifikasi"
+    )
+
+    search_query: str = Field(
+        ...,
+        description="Query pencarian presisi Tokopedia/Shopee"
+    )
+
 
 class TechFitRecommendation(BaseModel):
+
     device_type: str
+
     use_case: str
+
     total_budget: int
+
     items: List[HardwareItem]
+
     allocation_reasoning: str
-    # Field Tambahan untuk Badge/Disclaimer Gacha Model di UI Frontend:
-    model_used: str = Field(default="Unknown", description="Nama model Gemini yang memproses request")
-    tier_label: str = Field(default="Unknown", description="Label Tier model untuk UI Disclaimer")
+
+    model_used: str = Field(
+        default="Unknown",
+        description="Nama model Gemini yang memproses request"
+    )
+
+    tier_label: str = Field(
+        default="Unknown",
+        description="Label tier model"
+    )
 
 
-# =========================================================================
-# 5. CORE ALLOCATION ENDPOINT (WITH CASCADING FALLBACK)
-# =========================================================================
-@app.post("/api/allocate", response_model=TechFitRecommendation)
-def allocate_and_recommend(request: BudgetRequest):
-    budget = request.total_budget
-    device_type = request.device_type.lower()
-    use_case = request.use_case.lower()
+# ============================================================================
+# 5. PROMPT BUILDER
+# ============================================================================
+#
+# Prompt dibuat sekali.
+# Tidak ada perubahan besar terhadap logic original lu.
+#
+# ============================================================================
 
-    # ---------------------------------------------------------
-    # STEP A: CEK IN-MEMORY CACHE
-    # ---------------------------------------------------------
-    cache_key = get_cache_key(budget, device_type, use_case)
-    now = time.time()
+def build_prompt(
+    budget: int,
+    device_type: str,
+    use_case: str,
+    gpu_limit: int,
+    cpu_limit: int,
+    ram_storage_limit: int
+) -> str:
 
-    if cache_key in RECOMMENDATION_CACHE:
-        cached_data, timestamp = RECOMMENDATION_CACHE[cache_key]
-        if now - timestamp < CACHE_TTL_SECONDS:
-            print(f"[CACHE HIT] Returning cached result for key: {cache_key}")
-            return cached_data
+    return f"""
+Tindak sebagai pakar hardware PC/Laptop di Indonesia.
 
-    # ---------------------------------------------------------
-    # STEP B: DETERMINISTIC ALLOCATION RATIO ENGINE
-    # ---------------------------------------------------------
+Berikan rekomendasi perakitan atau unit laptop bekas/baru
+yang REALISTIS di pasar Indonesia saat ini.
+
+BATASAN MUTLAK (HARD CONSTRAINTS):
+
+- Tipe Perangkat: {device_type}
+- Kebutuhan Utama: {use_case}
+- Total Budget Maksimal: Rp {budget:,}
+- Alokasi Maksimal GPU: Rp {gpu_limit:,}
+- Alokasi Maksimal CPU: Rp {cpu_limit:,}
+- Alokasi Maksimal RAM & Storage: Rp {ram_storage_limit:,}
+
+ATURAN KHUSUS:
+
+1. Harga HARUS dalam bentuk range:
+   price_min dan price_max.
+
+2. Sertakan search_query yang presisi
+   agar pengguna bisa langsung copy/paste
+   ke marketplace seperti Tokopedia/Shopee.
+
+3. Total estimasi harga tidak boleh melebihi
+   total budget.
+
+4. Prioritaskan hardware yang realistis ditemukan
+   di pasar Indonesia.
+
+5. Jangan memberikan komponen yang jelas-jelas
+   melampaui batas alokasi kecuali ada alasan
+   kuat dan tetap tidak melampaui total budget.
+
+6. Jangan mengarang harga yang terlalu spesifik.
+   Gunakan price range yang realistis.
+
+7. Berikan rekomendasi yang konkret,
+   bukan sekadar kategori seperti
+   "gunakan GPU kelas menengah".
+
+Keluarkan response dalam format JSON
+sesuai schema yang diberikan.
+"""
+
+
+# ============================================================================
+# 6. DETERMINISTIC BUDGET ALLOCATION
+# ============================================================================
+#
+# Bagian ini TIDAK menggunakan AI.
+# Ini tetap dikontrol oleh backend.
+#
+# ============================================================================
+
+def calculate_budget_allocation(
+    budget: int,
+    use_case: str
+):
+
     if use_case == "gaming":
-        gpu_ratio, cpu_ratio, ram_storage_ratio = 0.40, 0.25, 0.35
+
+        gpu_ratio = 0.40
+        cpu_ratio = 0.25
+        ram_storage_ratio = 0.35
+
     elif use_case == "editing":
-        gpu_ratio, cpu_ratio, ram_storage_ratio = 0.30, 0.35, 0.35
+
+        gpu_ratio = 0.30
+        cpu_ratio = 0.35
+        ram_storage_ratio = 0.35
+
     else:
-        gpu_ratio, cpu_ratio, ram_storage_ratio = 0.15, 0.45, 0.40
+
+        gpu_ratio = 0.15
+        cpu_ratio = 0.45
+        ram_storage_ratio = 0.40
 
     gpu_limit = int(budget * gpu_ratio)
+
     cpu_limit = int(budget * cpu_ratio)
-    ram_storage_limit = int(budget * ram_storage_ratio)
 
-    prompt = f"""
-    Tindak sebagai pakar hardware PC/Laptop di Indonesia.
-    Berikan rekomendasi perakitan atau unit laptop bekas/baru yang REALISTIS di pasar Indonesia saat ini.
-    
-    BATASAN MUTLAK (HARD CONSTRAINTS):
-    - Tipe Perangkat: {device_type}
-    - Kebutuhan Utama: {use_case}
-    - Total Budget Maksimal: Rp {budget:,}
-    - Alokasi Maksimal GPU: Rp {gpu_limit:,}
-    - Alokasi Maksimal CPU: Rp {cpu_limit:,}
-    - Alokasi Maksimal RAM & Storage: Rp {ram_storage_limit:,}
-    
-    ATURAN KHUSUS METODE REFERENSI:
-    1. Harga HARUS dalam bentuk range (price_min & price_max) untuk mengantisipasi fluktuasi pasar.
-    2. Sertakan 'search_query' yang presisi agar pengguna bisa langsung copy/paste ke marketplace.
-    3. Pastikan total estimasi harga tidak melebihi total budget.
-    """
+    ram_storage_limit = int(
+        budget * ram_storage_ratio
+    )
 
-    # ---------------------------------------------------------
-    # STEP C: CASCADING MODEL FALLBACK EXECUTION
-    # ---------------------------------------------------------
-    last_error_msg = ""
-    
-    # Loop mencoba setiap model di dalam hirarki (Tier 1 -> Tier 2 -> Tier 3)
-    for model_info in MODEL_FALLBACK_CHAIN:
-        target_model = model_info["name"]
-        tier_label = model_info["tier"]
-        
-        try:
-            # Ambil client baru dengan Key hasil rotasi round-robin
-            client = get_genai_client()
-            
-            print(f"[EXECUTE] Trying model '{target_model}' ({tier_label})...")
+    return (
+        gpu_limit,
+        cpu_limit,
+        ram_storage_limit
+    )
 
-            response = client.models.generate_content(
-                model=target_model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=TechFitRecommendation,
-                    temperature=0.2,
-                ),
+
+# ============================================================================
+# 7. ERROR CLASSIFICATION
+# ============================================================================
+
+def is_retryable_gemini_error(error: Exception) -> bool:
+
+    error_string = str(error).upper()
+
+    retryable_errors = [
+        "429",
+        "RESOURCE_EXHAUSTED",
+        "503",
+        "UNAVAILABLE",
+        "404",
+        "NOT_FOUND"
+    ]
+
+    return any(
+        error_code in error_string
+        for error_code in retryable_errors
+    )
+
+
+def get_http_error_from_gemini(error: Exception):
+
+    error_string = str(error).upper()
+
+    if (
+        "429" in error_string
+        or "RESOURCE_EXHAUSTED" in error_string
+    ):
+        return HTTPException(
+            status_code=429,
+            detail=(
+                "Quota Gemini sedang mencapai batas. "
+                "Silakan coba lagi beberapa saat."
+            )
+        )
+
+    if (
+        "503" in error_string
+        or "UNAVAILABLE" in error_string
+    ):
+        return HTTPException(
+            status_code=503,
+            detail=(
+                "Server Gemini sedang tidak tersedia. "
+                "Silakan coba lagi."
+            )
+        )
+
+    return HTTPException(
+        status_code=500,
+        detail=f"Gagal memproses rekomendasi: {str(error)}"
+    )
+
+
+# ============================================================================
+# 8. GEMINI REQUEST
+# ============================================================================
+
+def call_gemini(
+    model_name: str,
+    prompt: str
+) -> dict:
+
+    client, key_index = get_genai_client()
+
+    print(
+        f"[EXECUTE] Model={model_name} "
+        f"KeyIndex={key_index}"
+    )
+
+    response = client.models.generate_content(
+        model=model_name,
+        contents=prompt,
+
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+
+            response_schema=TechFitRecommendation,
+
+            temperature=0.2,
+        )
+    )
+
+    if not response.text:
+        raise RuntimeError(
+            "Gemini mengembalikan response kosong."
+        )
+
+    try:
+
+        recommendation_data = json.loads(
+            response.text
+        )
+
+    except json.JSONDecodeError as e:
+
+        raise RuntimeError(
+            f"Response Gemini bukan JSON valid: {e}"
+        )
+
+    # Validasi ulang menggunakan schema Pydantic.
+    validated = TechFitRecommendation.model_validate(
+        recommendation_data
+    )
+
+    result = validated.model_dump()
+
+    # Metadata backend
+    result["model_used"] = model_name
+
+    result["tier_label"] = (
+        MODEL_METADATA[model_name]["tier"]
+    )
+
+    return result
+
+
+# ============================================================================
+# 9. CORE ENDPOINT
+# ============================================================================
+
+@app.post(
+    "/api/allocate",
+    response_model=TechFitRecommendation
+)
+def allocate_and_recommend(
+    request: BudgetRequest
+):
+
+    # ------------------------------------------------------------------------
+    # STEP A — NORMALIZE INPUT
+    # ------------------------------------------------------------------------
+
+    budget = request.total_budget
+
+    device_type = (
+        request.device_type.strip().lower()
+    )
+
+    use_case = (
+        request.use_case.strip().lower()
+    )
+
+    # ------------------------------------------------------------------------
+    # STEP B — CACHE LOOKUP
+    # ------------------------------------------------------------------------
+
+    cache_key = get_cache_key(
+        budget=budget,
+        device_type=device_type,
+        use_case=use_case
+    )
+
+    cached_result = get_cached_result(
+        cache_key
+    )
+
+    if cached_result is not None:
+
+        print(
+            f"[CACHE HIT] {cache_key}"
+        )
+
+        return cached_result
+
+    print(
+        f"[CACHE MISS] {cache_key}"
+    )
+
+    # ------------------------------------------------------------------------
+    # STEP C — DETERMINISTIC ALLOCATION
+    # ------------------------------------------------------------------------
+
+    (
+        gpu_limit,
+        cpu_limit,
+        ram_storage_limit
+    ) = calculate_budget_allocation(
+        budget,
+        use_case
+    )
+
+    print(
+        "[ALLOCATION] "
+        f"GPU=Rp {gpu_limit:,} | "
+        f"CPU=Rp {cpu_limit:,} | "
+        f"RAM+Storage=Rp {ram_storage_limit:,}"
+    )
+
+    # ------------------------------------------------------------------------
+    # STEP D — BUILD PROMPT
+    # ------------------------------------------------------------------------
+
+    prompt = build_prompt(
+        budget=budget,
+        device_type=device_type,
+        use_case=use_case,
+        gpu_limit=gpu_limit,
+        cpu_limit=cpu_limit,
+        ram_storage_limit=ram_storage_limit
+    )
+
+    # ------------------------------------------------------------------------
+    # STEP E — PRIMARY MODEL
+    # ------------------------------------------------------------------------
+
+    last_error = None
+
+    try:
+
+        result = call_gemini(
+            model_name=PRIMARY_MODEL,
+            prompt=prompt
+        )
+
+        # Cache hanya response yang benar-benar sukses.
+        set_cached_result(
+            cache_key,
+            result
+        )
+
+        print(
+            f"[SUCCESS] Primary model: "
+            f"{PRIMARY_MODEL}"
+        )
+
+        return result
+
+    except Exception as e:
+
+        last_error = e
+
+        print(
+            f"[PRIMARY FAILED] "
+            f"{PRIMARY_MODEL}: {str(e)[:200]}"
+        )
+
+        # Kalau error bukan jenis yang layak fallback,
+        # langsung hentikan request.
+        if not is_retryable_gemini_error(e):
+
+            print(
+                "[FATAL] Error bukan retryable. "
+                "Tidak menjalankan fallback."
             )
 
-            # Parsing JSON response dari Gemini
-            recommendation_data = json.loads(response.text)
-            
-            # Inject Metadata Model & Tier untuk UI Frontend
-            recommendation_data["model_used"] = target_model
-            recommendation_data["tier_label"] = tier_label
+            raise get_http_error_from_gemini(e)
 
-            # Simpan hasil sukses ke cache
-            RECOMMENDATION_CACHE[cache_key] = (recommendation_data, now)
-            
-            print(f"[SUCCESS] Recommendation generated using model: '{target_model}'")
-            return recommendation_data
+    # ------------------------------------------------------------------------
+    # STEP F — SINGLE FALLBACK
+    # ------------------------------------------------------------------------
+    #
+    # Hanya dijalankan kalau primary gagal karena:
+    # 429 / 503 / unavailable / model not found.
+    #
+    # Tidak ada fallback chain panjang lagi.
+    #
+    # ------------------------------------------------------------------------
 
-        except Exception as e:
-            error_str = str(e)
-            last_error_msg = error_str
-            
-            # Jika kena 429 (Rate Limit), 503 (Server Busy), atau 404 (Model Not Found) -> Lanjut ke model berikutnya!
-            if any(err in error_str for err in ["429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE", "404", "NOT_FOUND"]):
-                print(f"[FALLBACK TRIGGERED] Model '{target_model}' failed/limited ({error_str[:60]}...). Moving to next model in chain.")
-                continue
-            else:
-                # Jika error sintaks/fatal yang bukan dari API limit
-                print(f"[FATAL ERROR] Non-recoverable error on model '{target_model}': {error_str}")
-                break
+    print(
+        f"[FALLBACK] Switching to "
+        f"{FALLBACK_MODEL}"
+    )
 
-    # ---------------------------------------------------------
-    # STEP D: EXHAUSTION HANDLER (Jika semua model & key habis)
-    # ---------------------------------------------------------
-    if "429" in last_error_msg or "RESOURCE_EXHAUSTED" in last_error_msg:
-        raise HTTPException(
-            status_code=429,
-            detail="Seluruh model AI sedang mencapai batas kuota (Rate Limit). Tunggu sekitar 15-30 detik lalu coba lagi."
+    try:
+
+        result = call_gemini(
+            model_name=FALLBACK_MODEL,
+            prompt=prompt
         )
-    elif "503" in last_error_msg or "UNAVAILABLE" in last_error_msg:
-        raise HTTPException(
-            status_code=503,
-            detail="Server Google AI sedang padat di semua tier. Silakan coba sebentar lagi."
+
+        set_cached_result(
+            cache_key,
+            result
         )
-    else:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Gagal memproses rekomendasi di seluruh rantai model: {last_error_msg}"
+
+        print(
+            f"[SUCCESS] Fallback model: "
+            f"{FALLBACK_MODEL}"
         )
+
+        return result
+
+    except Exception as fallback_error:
+
+        print(
+            f"[FALLBACK FAILED] "
+            f"{FALLBACK_MODEL}: "
+            f"{str(fallback_error)[:200]}"
+        )
+
+        # Kalau fallback juga gagal,
+        # jangan mencoba model ketiga, keempat, dst.
+        raise get_http_error_from_gemini(
+            fallback_error
+        )
+
+
+# ============================================================================
+# 10. HEALTH CHECK
+# ============================================================================
+
+@app.get("/")
+def root():
+
+    return {
+        "status": "online",
+        "service": "TechFit Core Engine",
+        "primary_model": PRIMARY_MODEL,
+        "fallback_model": FALLBACK_MODEL,
+        "cache_entries": len(RECOMMENDATION_CACHE)
+    }
+
+
+@app.get("/health")
+def health():
+
+    return {
+        "status": "healthy",
+        "cache_entries": len(RECOMMENDATION_CACHE),
+        "gemini_keys": len(valid_keys)
+    }
